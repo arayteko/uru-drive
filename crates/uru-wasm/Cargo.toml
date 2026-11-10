@@ -1,0 +1,22 @@
+[package]
+name = "uru-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+uru-core = { workspace = true }
+blake3 = { workspace = true }
+fastcdc = { workspace = true }
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
+web-sys = { workspace = true }
+console_error_panic_hook = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde-wasm-bindgen = "0.6.5"
+hex = { workspace = true }

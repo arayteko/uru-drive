@@ -1,0 +1,23 @@
+[package]
+name = "uru-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+fastcdc = { workspace = true }
+crc32fast = { workspace = true }
+md-5 = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+bytes = { workspace = true }
+metrics = { workspace = true }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+rand = "0.9.5"

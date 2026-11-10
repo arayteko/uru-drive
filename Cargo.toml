@@ -1,0 +1,84 @@
+[workspace]
+members = [
+    "crates/uru-core",
+    "crates/uru-storage",
+    "crates/uru-server",
+    "crates/uru-cli",
+    "crates/uru-wasm",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["UruDrive Team"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+uru-core = { path = "crates/uru-core" }
+uru-storage = { path = "crates/uru-storage" }
+uru-server = { path = "crates/uru-server" }
+uru-wasm = { path = "crates/uru-wasm" }
+
+# Hashing & Deduplication
+blake3 = "1.8.7"
+fastcdc = "5.0.0"
+fastbloom = "0.17.0"
+crc32fast = "1.5.0"
+md-5 = "0.11.0"
+sha2 = "0.11.1"
+
+# Concurrency & Memory
+arc-swap = "1.9.5"
+dashmap = "6.2.1"
+parking_lot = "0.12.5"
+bytes = "1.12.1"
+async-trait = "0.1.92"
+rand = "0.9.5"
+
+# Serialization & IDs
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+uuid = { version = "1.29.2", features = ["v7", "serde", "std", "rng", "js"] }
+hex = "0.4.3"
+
+# Async & Networking
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-util = { version = "0.7.20", features = ["io"] }
+futures = "0.3.34"
+axum = { version = "0.8.9", features = ["json", "tokio", "http1", "http2"] }
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.6.11", features = ["cors", "trace", "fs"] }
+hyper = { version = "1.12.0", features = ["full"] }
+hyper-util = { version = "0.1.21", features = ["full"] }
+http = "1.5.0"
+http-body-util = "0.1.5"
+reqwest = { version = "0.13.5", features = ["json", "stream"] }
+
+# Protocols
+s3s = "0.17.0"
+dav-server = "0.12.0"
+
+# CLI
+clap = { version = "4.5.60", features = ["derive", "env"] }
+
+# Observability
+metrics = "0.24.6"
+metrics-exporter-prometheus = "0.18.3"
+opentelemetry = { version = "0.33.1", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.33.1", features = ["metrics"] }
+opentelemetry-otlp = { version = "0.33.1", features = ["metrics", "http-proto", "reqwest-blocking-client"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# Auth & Security
+argon2 = "0.6.0"
+subtle = "2.6.1"
+base64 = "0.22.1"
+libc = "0.2.191"
+
+# WASM
+wasm-bindgen = "0.2.100"
+js-sys = "0.3.77"
+web-sys = "0.3.77"
+console_error_panic_hook = "0.1.7"
