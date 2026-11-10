@@ -4,6 +4,7 @@ pub mod dav_adapter;
 pub mod metrics_service;
 pub mod s3_adapter;
 pub mod state;
+pub mod user_api;
 
 use axum::{
     body::Body,
@@ -45,9 +46,10 @@ pub fn build_app(state: AppState) -> Router {
         ]);
 
     let custom_api = custom_api::custom_api_router();
+    let user_mgmt = user_api::user_management_router();
 
     Router::new()
-        .nest("/api/v1", custom_api)
+        .nest("/api/v1", custom_api.merge(user_mgmt))
         .route(
             "/metrics",
             get(move || {
@@ -71,7 +73,7 @@ async fn webdav_handler(
     State(state): State<AppState>,
     req: Request,
 ) -> Result<Response, StatusCode> {
-    // Determine authenticated user for WebDAV (supporting Basic auth or default)
+    // Determine authenticated user for WebDAV (supporting Basic auth or Bearer token)
     let auth_header = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -79,22 +81,25 @@ async fn webdav_handler(
 
     let user_id = if let Some(header_val) = auth_header {
         if let Some(basic) = header_val.strip_prefix("Basic ") {
-            state
-                .users
-                .authenticate_basic(basic)
-                .map(|u| u.user_id)
-                .unwrap_or_else(|| "default_user".to_string())
+            state.users.authenticate_basic(basic).map(|u| u.user_id)
         } else if let Some(bearer) = header_val.strip_prefix("Bearer ") {
-            state
-                .users
-                .authenticate_api_key(bearer)
-                .map(|u| u.user_id)
-                .unwrap_or_else(|| "default_user".to_string())
+            state.users.authenticate_api_key(bearer).map(|u| u.user_id)
         } else {
-            "default_user".to_string()
+            None
         }
     } else {
-        "default_user".to_string()
+        None
+    };
+
+    let user_id = match user_id {
+        Some(uid) => uid,
+        None => {
+            return Ok(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header(header::WWW_AUTHENTICATE, "Basic realm=\"UruDrive WebDAV\"")
+                .body(Body::from("Unauthorized"))
+                .unwrap());
+        }
     };
 
     let fs = UruDavFileSystem::new(user_id, state.storage.clone());

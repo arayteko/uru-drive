@@ -1,7 +1,6 @@
 use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tracing::info;
 use uru_server::{
     auth::UserStore,
@@ -35,7 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prometheus_handle = setup_prometheus();
 
     let storage = StorageEngine::open(&args.data_dir)?;
-    let users = Arc::new(UserStore::new());
+    let auth_db_dir = args.data_dir.join("auth_db");
+    let (users, _) = UserStore::open(&auth_db_dir)?;
 
     let state = AppState::new(storage, users).with_prometheus(prometheus_handle);
     let app = build_app(state);

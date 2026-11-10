@@ -1,7 +1,6 @@
 use crate::bloom::GlobalBloomFilter;
 use crate::index::{ChunkIndex, ChunkLocation, ChunkState};
 use crate::pack::{PackManager, TrailerEntry};
-use dashmap::DashMap;
 use parking_lot::RwLock;
 pub use uru_core::GcStats;
 use std::collections::{HashMap, HashSet};
@@ -23,7 +22,7 @@ pub struct GcEngine;
 
 impl GcEngine {
     pub fn run_gc(
-        vfs: &DashMap<(String, String), VersionedFile>,
+        vfs_db: &rocksdb::DB,
         chunk_index: &ChunkIndex,
         bloom: &GlobalBloomFilter,
         pack_mgr: &PackManager,
@@ -34,23 +33,44 @@ impl GcEngine {
         let start_time = Instant::now();
         metrics::counter!("uru_cas_gc_runs_total").increment(1);
 
-        // 1. Retention Policy Pruning
-        let mut versions_pruned = 0;
-        for mut entry in vfs.iter_mut() {
-            let pruned = entry.value_mut().prune_retention(retention, now_ms);
-            versions_pruned += pruned;
-        }
-
-        // 2. Mark Phase: collect all referenced chunk hashes from all live FileVersions
+        // 1. Retention Policy Pruning & Mark Phase:
+        // Collect all referenced chunk hashes from all live FileVersions in RocksDB
         let mut live_hashes = HashSet::new();
-        for entry in vfs.iter() {
-            for ver in &entry.value().versions {
-                if let Some(manifest) = &ver.manifest {
-                    for chunk in &manifest.chunks {
-                        live_hashes.insert(chunk.hash);
+        let mut versions_pruned = 0;
+        let mut keys_to_delete = Vec::new();
+        let mut updates = Vec::new();
+
+        let iter = vfs_db.iterator(rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, val) = item.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            if let Ok(mut vf) = serde_json::from_slice::<VersionedFile>(&val) {
+                let pruned = vf.prune_retention(retention, now_ms);
+                versions_pruned += pruned;
+                if vf.versions.is_empty() {
+                    keys_to_delete.push(key.to_vec());
+                } else {
+                    for ver in &vf.versions {
+                        if let Some(manifest) = &ver.manifest {
+                            for chunk in &manifest.chunks {
+                                live_hashes.insert(chunk.hash);
+                            }
+                        }
+                    }
+                    if pruned > 0 {
+                        if let Ok(new_val) = serde_json::to_vec(&vf) {
+                            updates.push((key.to_vec(), new_val));
+                        }
                     }
                 }
             }
+        }
+
+        // Apply retention updates & deletes to RocksDB
+        for (k, v) in updates {
+            let _ = vfs_db.put(&k, &v);
+        }
+        for k in keys_to_delete {
+            let _ = vfs_db.delete(&k);
         }
 
         // 3. Sweep & Tombstoning + Hole Punching

@@ -380,6 +380,10 @@ fn storage_error_response(err: StorageError) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Serialization error: {e}"),
         ),
+        StorageError::Database(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {e}"),
+        ),
     };
 
     (status, Json(serde_json::json!({ "error": msg }))).into_response()

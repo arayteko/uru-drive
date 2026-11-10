@@ -5,7 +5,7 @@ use crate::pack::{PackManager, TrailerEntry, MAX_PACKFILE_SIZE};
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -35,22 +35,27 @@ pub enum StorageError {
     Io(#[from] io::Error),
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("Database error: {0}")]
+    Database(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedVfsEntry {
-    user_id: String,
-    path: String,
-    file: VersionedFile,
+impl From<rocksdb::Error> for StorageError {
+    fn from(err: rocksdb::Error) -> Self {
+        StorageError::Database(err.to_string())
+    }
+}
+
+#[inline]
+fn vfs_key(user_id: &str, norm_path: &str) -> Vec<u8> {
+    format!("{}\0{}", user_id, norm_path).into_bytes()
 }
 
 pub struct StorageEngine {
     root_dir: PathBuf,
-    metadata_dir: PathBuf,
+    vfs_db: Arc<rocksdb::DB>,
     pack_mgr: PackManager,
     chunk_index: ChunkIndex,
     bloom: GlobalBloomFilter,
-    vfs: DashMap<(String, String), VersionedFile>, // (user_id, normalized_path) -> VersionedFile
     active_pack: RwLock<ActivePackState>,
 }
 
@@ -59,9 +64,14 @@ impl StorageEngine {
         let root_dir = root_dir.into();
         let packs_dir = root_dir.join("packs");
         let metadata_dir = root_dir.join("metadata");
+        let vfs_db_path = root_dir.join("vfs_db");
 
         std::fs::create_dir_all(&packs_dir)?;
         std::fs::create_dir_all(&metadata_dir)?;
+
+        let mut db_opts = rocksdb::Options::default();
+        db_opts.create_if_missing(true);
+        let vfs_db = Arc::new(rocksdb::DB::open(&db_opts, &vfs_db_path)?);
 
         let pack_mgr = PackManager::new(&packs_dir)?;
         let chunk_index = DashMap::new();
@@ -118,16 +128,28 @@ impl StorageEngine {
             entries: Vec::new(),
         });
 
-        // Load VFS metadata if present
-        let vfs = DashMap::new();
-        let vfs_metadata_file = metadata_dir.join("vfs.json");
-        if vfs_metadata_file.exists() {
-            if let Ok(file) = File::open(&vfs_metadata_file) {
-                if let Ok(entries) = serde_json::from_reader::<_, Vec<SerializedVfsEntry>>(file) {
-                    for entry in entries {
-                        vfs.insert((entry.user_id, entry.path), entry.file);
+        // Migrate legacy vfs.json if it exists and vfs_db has no keys
+        let legacy_vfs_file = metadata_dir.join("vfs.json");
+        if legacy_vfs_file.exists() {
+            let mut iter = vfs_db.raw_iterator();
+            iter.seek_to_first();
+            if !iter.valid() {
+                if let Ok(file) = File::open(&legacy_vfs_file) {
+                    #[derive(Deserialize)]
+                    struct LegacyEntry {
+                        user_id: String,
+                        path: String,
+                        file: VersionedFile,
                     }
-                    info!(entries = vfs.len(), "VFS metadata loaded from disk");
+                    if let Ok(entries) = serde_json::from_reader::<_, Vec<LegacyEntry>>(file) {
+                        for entry in entries {
+                            let key = vfs_key(&entry.user_id, &entry.path);
+                            if let Ok(val) = serde_json::to_vec(&entry.file) {
+                                let _ = vfs_db.put(&key, val);
+                            }
+                        }
+                        info!("Migrated legacy vfs.json into RocksDB");
+                    }
                 }
             }
         }
@@ -137,11 +159,10 @@ impl StorageEngine {
 
         Ok(Arc::new(Self {
             root_dir,
-            metadata_dir,
+            vfs_db,
             pack_mgr,
             chunk_index,
             bloom,
-            vfs,
             active_pack,
         }))
     }
@@ -315,15 +336,16 @@ impl StorageEngine {
             .unwrap()
             .as_millis() as u64;
 
-        let mut vf_entry = self
-            .vfs
-            .entry((user_id.to_string(), norm_path.clone()))
-            .or_insert_with(|| VersionedFile::new(&norm_path));
+        let key = vfs_key(user_id, &norm_path);
+        let mut vf = match self.vfs_db.get(&key)? {
+            Some(val) => serde_json::from_slice::<VersionedFile>(&val)?,
+            None => VersionedFile::new(&norm_path),
+        };
 
-        let version = vf_entry.value_mut().add_version(manifest, now_ms, parent_version);
-        drop(vf_entry);
+        let version = vf.add_version(manifest, now_ms, parent_version);
+        let val = serde_json::to_vec(&vf)?;
+        self.vfs_db.put(&key, val)?;
 
-        self.persist_vfs()?;
         Ok(version)
     }
 
@@ -335,19 +357,19 @@ impl StorageEngine {
         version_id: Option<Uuid>,
     ) -> Result<FileVersion, StorageError> {
         let norm_path = normalize_path(path).map_err(StorageError::InvalidPath)?;
-        let entry = self
-            .vfs
-            .get(&(user_id.to_string(), norm_path.clone()))
+        let key = vfs_key(user_id, &norm_path);
+        let val = self
+            .vfs_db
+            .get(&key)?
             .ok_or_else(|| StorageError::FileNotFound(norm_path.clone()))?;
 
+        let vf: VersionedFile = serde_json::from_slice(&val)?;
         match version_id {
-            Some(vid) => entry
-                .value()
+            Some(vid) => vf
                 .find_version(vid)
                 .cloned()
                 .ok_or(StorageError::VersionNotFound(vid)),
-            None => entry
-                .value()
+            None => vf
                 .head_live()
                 .cloned()
                 .ok_or_else(|| StorageError::FileNotFound(norm_path)),
@@ -362,40 +384,61 @@ impl StorageEngine {
         version_id: Option<Uuid>,
     ) -> Result<FileVersion, StorageError> {
         let norm_path = normalize_path(path).map_err(StorageError::InvalidPath)?;
-        let mut entry = self
-            .vfs
-            .get_mut(&(user_id.to_string(), norm_path.clone()))
+        let key = vfs_key(user_id, &norm_path);
+        let val = self
+            .vfs_db
+            .get(&key)?
             .ok_or_else(|| StorageError::FileNotFound(norm_path.clone()))?;
 
+        let mut vf: VersionedFile = serde_json::from_slice(&val)?;
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
 
         let result = match version_id {
-            Some(vid) => entry
-                .value_mut()
+            Some(vid) => vf
                 .remove_version(vid)
                 .ok_or(StorageError::VersionNotFound(vid))?,
-            None => entry.value_mut().add_delete_marker(now_ms),
+            None => vf.add_delete_marker(now_ms),
         };
 
-        drop(entry);
-        self.persist_vfs()?;
+        if vf.versions.is_empty() {
+            self.vfs_db.delete(&key)?;
+        } else {
+            self.vfs_db.put(&key, serde_json::to_vec(&vf)?)?;
+        }
+
         Ok(result)
     }
 
     /// List live files for a user matching a prefix
     pub fn list_files(&self, user_id: &str, prefix: &str) -> Vec<(String, FileVersion)> {
+        let user_prefix = format!("{}\0", user_id);
         let mut results = Vec::new();
-        for entry in self.vfs.iter() {
-            let ((uid, path), vf) = entry.pair();
-            if uid == user_id && path.starts_with(prefix) {
-                if let Some(head) = vf.head_live() {
-                    results.push((path.clone(), head.clone()));
+        let mut iter = self.vfs_db.raw_iterator();
+        iter.seek(user_prefix.as_bytes());
+
+        while iter.valid() {
+            if let (Some(k), Some(v)) = (iter.key(), iter.value()) {
+                if !k.starts_with(user_prefix.as_bytes()) {
+                    break;
+                }
+                if let Ok(key_str) = std::str::from_utf8(k) {
+                    if let Some(path) = key_str.strip_prefix(&user_prefix) {
+                        if path.starts_with(prefix) {
+                            if let Ok(vf) = serde_json::from_slice::<VersionedFile>(v) {
+                                if let Some(head) = vf.head_live() {
+                                    results.push((path.to_string(), head.clone()));
+                                }
+                            }
+                        }
+                    }
                 }
             }
+            iter.next();
         }
+
         results.sort_by(|a, b| a.0.cmp(&b.0));
         results
     }
@@ -407,11 +450,13 @@ impl StorageEngine {
         path: &str,
     ) -> Result<Vec<FileVersion>, StorageError> {
         let norm_path = normalize_path(path).map_err(StorageError::InvalidPath)?;
-        let entry = self
-            .vfs
-            .get(&(user_id.to_string(), norm_path.clone()))
+        let key = vfs_key(user_id, &norm_path);
+        let val = self
+            .vfs_db
+            .get(&key)?
             .ok_or_else(|| StorageError::FileNotFound(norm_path))?;
-        Ok(entry.value().versions.clone())
+        let vf: VersionedFile = serde_json::from_slice(&val)?;
+        Ok(vf.versions)
     }
 
     /// Restore an older version to HEAD
@@ -422,23 +467,23 @@ impl StorageEngine {
         version_id: Uuid,
     ) -> Result<FileVersion, StorageError> {
         let norm_path = normalize_path(path).map_err(StorageError::InvalidPath)?;
-        let mut entry = self
-            .vfs
-            .get_mut(&(user_id.to_string(), norm_path.clone()))
+        let key = vfs_key(user_id, &norm_path);
+        let val = self
+            .vfs_db
+            .get(&key)?
             .ok_or_else(|| StorageError::FileNotFound(norm_path.clone()))?;
 
+        let mut vf: VersionedFile = serde_json::from_slice(&val)?;
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
 
-        let restored = entry
-            .value_mut()
+        let restored = vf
             .restore_version(version_id, now_ms)
             .ok_or(StorageError::VersionNotFound(version_id))?;
 
-        drop(entry);
-        self.persist_vfs()?;
+        self.vfs_db.put(&key, serde_json::to_vec(&vf)?)?;
         Ok(restored)
     }
 
@@ -450,7 +495,7 @@ impl StorageEngine {
             .as_millis() as u64;
 
         let stats = GcEngine::run_gc(
-            &self.vfs,
+            &self.vfs_db,
             &self.chunk_index,
             &self.bloom,
             &self.pack_mgr,
@@ -459,7 +504,6 @@ impl StorageEngine {
             now_ms,
         )?;
 
-        self.persist_vfs()?;
         Ok(stats)
     }
 
@@ -507,27 +551,6 @@ impl StorageEngine {
             .filter(|e| e.value().state == ChunkState::Live)
             .count()
     }
-
-    fn persist_vfs(&self) -> Result<(), StorageError> {
-        let entries: Vec<SerializedVfsEntry> = self
-            .vfs
-            .iter()
-            .map(|e| SerializedVfsEntry {
-                user_id: e.key().0.clone(),
-                path: e.key().1.clone(),
-                file: e.value().clone(),
-            })
-            .collect();
-
-        let vfs_path = self.metadata_dir.join("vfs.json");
-        let temp_path = self.metadata_dir.join("vfs.json.tmp");
-
-        let file = File::create(&temp_path)?;
-        serde_json::to_writer_pretty(file, &entries)?;
-        std::fs::rename(temp_path, vfs_path)?;
-
-        Ok(())
-    }
 }
 
 impl Drop for StorageEngine {
@@ -537,7 +560,7 @@ impl Drop for StorageEngine {
             let path = self.pack_mgr.pack_path(active.pack_id);
             let _ = PackManager::seal_packfile(&path, &active.entries);
         }
-        let _ = self.persist_vfs();
+        let _ = self.vfs_db.flush();
     }
 }
 

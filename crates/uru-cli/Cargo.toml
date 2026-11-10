@@ -21,3 +21,9 @@ uuid = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+uru-server = { workspace = true }
+uru-storage = { workspace = true }
+axum = { workspace = true }
+tempfile = "3.17.1"

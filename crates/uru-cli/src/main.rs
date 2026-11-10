@@ -20,6 +20,7 @@ use uuid::Uuid;
 struct Cli {
     #[arg(
         long,
+        global = true,
         default_value = "http://127.0.0.1:8080",
         env = "URU_SERVER",
         help = "UruDrive server URL"
@@ -28,11 +29,11 @@ struct Cli {
 
     #[arg(
         long,
-        default_value = "uru_demo_key_1234567890abcdef",
+        global = true,
         env = "URU_API_KEY",
-        help = "UruDrive API key"
+        help = "UruDrive API token (or set URU_API_KEY env var)"
     )]
-    api_key: String,
+    api_key: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -74,6 +75,66 @@ enum Commands {
         remote_path: String,
         version_id: Uuid,
     },
+    /// Manage users and roles (admin or self)
+    #[command(subcommand)]
+    User(UserCommands),
+    /// Manage API tokens (admin or self)
+    #[command(subcommand)]
+    Token(TokenCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum UserCommands {
+    /// Create a new user (admin only)
+    Create {
+        user_id: String,
+        password: String,
+        #[arg(long, default_value = "user", help = "Role: 'admin' or 'user'")]
+        role: String,
+    },
+    /// List all users (admin only)
+    Ls,
+    /// Get details of a user ('me' for caller, or user_id)
+    Get {
+        #[arg(default_value = "me", help = "User ID to query (or 'me')")]
+        user_id: String,
+    },
+    /// Update user password (self or admin)
+    Passwd {
+        #[arg(help = "User ID ('me' or specific user_id)")]
+        user_id: String,
+        #[arg(help = "New password")]
+        new_password: String,
+    },
+    /// Update user role (admin only)
+    SetRole {
+        user_id: String,
+        #[arg(help = "New role: 'admin' or 'user'")]
+        role: String,
+    },
+    /// Delete user (admin only)
+    Delete {
+        user_id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TokenCommands {
+    /// Create a new API token (self or admin)
+    Create {
+        name: String,
+        #[arg(long, help = "Target user ID (admin only, defaults to caller)")]
+        user_id: Option<String>,
+    },
+    /// List API tokens
+    Ls {
+        #[arg(long, help = "Filter by user ID (admin only, or 'all')")]
+        user_id: Option<String>,
+    },
+    /// Revoke an API token by ID
+    Revoke {
+        token_id: Uuid,
+    },
 }
 
 #[tokio::main]
@@ -82,10 +143,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     let base_url = cli.server.trim_end_matches('/');
 
+    let api_key = match cli.api_key {
+        Some(k) => k,
+        None => {
+            eprintln!("Error: Authentication token required.");
+            eprintln!("Please specify --api-key <token> or set URU_API_KEY environment variable.");
+            std::process::exit(1);
+        }
+    };
+
     let mut headers = HeaderMap::new();
     headers.insert(
         AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", cli.api_key))?,
+        HeaderValue::from_str(&format!("Bearer {}", api_key))?,
     );
 
     match cli.command {
@@ -151,69 +221,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 skipped_count, dedup_ratio, missing_count
             );
 
-            // Step 2: Batch upload only missing chunks
+            // Step 2: Upload missing chunks via POST /api/v1/chunks/batch
             if missing_count > 0 {
-                let to_upload: Vec<BatchChunk> = batch_chunks
+                let missing_batches: Vec<BatchChunk> = batch_chunks
                     .into_iter()
                     .filter(|c| missing_set.contains(&c.hash.to_hex()))
                     .collect();
 
-                let mut current_batch = Vec::new();
-                let mut current_size = 0usize;
-                const BATCH_LIMIT: usize = 15 * 1024 * 1024; // 15MB chunks per batch
+                let missing_bytes: usize = missing_batches.iter().map(|c| c.data.len()).sum();
+                println!(
+                    "Uploading {} missing chunks ({} bytes raw payload)...",
+                    missing_batches.len(),
+                    missing_bytes
+                );
 
-                for chunk in to_upload {
-                    let chunk_len = chunk.data.len();
-                    if current_size + chunk_len > BATCH_LIMIT && !current_batch.is_empty() {
-                        let encoded = encode_batch(&current_batch);
-                        let upload_url = format!("{}/api/v1/chunks/batch", base_url);
-                        let up_res = client
-                            .post(&upload_url)
-                            .headers(headers.clone())
-                            .header(CONTENT_TYPE, "application/octet-stream")
-                            .body(encoded)
-                            .send()
-                            .await?;
+                let batch_bytes = encode_batch(&missing_batches);
+                let upload_url = format!("{}/api/v1/chunks/batch", base_url);
+                let upload_res = client
+                    .post(&upload_url)
+                    .headers(headers.clone())
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .body(batch_bytes)
+                    .send()
+                    .await?;
 
-                        if !up_res.status().is_success() {
-                            eprintln!("Batch upload failed: {}", up_res.text().await?);
-                            std::process::exit(1);
-                        }
-                        current_batch.clear();
-                        current_size = 0;
-                    }
-                    current_size += chunk_len;
-                    current_batch.push(chunk);
+                if !upload_res.status().is_success() {
+                    eprintln!("Batch upload failed: {}", upload_res.text().await?);
+                    std::process::exit(1);
                 }
-
-                if !current_batch.is_empty() {
-                    let encoded = encode_batch(&current_batch);
-                    let upload_url = format!("{}/api/v1/chunks/batch", base_url);
-                    let up_res = client
-                        .post(&upload_url)
-                        .headers(headers.clone())
-                        .header(CONTENT_TYPE, "application/octet-stream")
-                        .body(encoded)
-                        .send()
-                        .await?;
-
-                    if !up_res.status().is_success() {
-                        eprintln!("Final batch upload failed: {}", up_res.text().await?);
-                        std::process::exit(1);
-                    }
-                }
+                println!("Chunks uploaded successfully.");
+            } else {
+                println!("All chunks already present on server (100% deduplication).");
             }
 
-            // Step 3: Commit FileManifest
+            // Step 3: Commit FileManifest via POST /api/v1/files/commit
+            println!("Committing file manifest to '{}'...", remote_path);
             let commit_url = format!("{}/api/v1/files/commit", base_url);
+            let commit_payload = serde_json::json!({
+                "path": remote_path,
+                "manifest": manifest,
+                "parent_version_id": null
+            });
+
             let commit_res = client
                 .post(&commit_url)
                 .headers(headers.clone())
-                .json(&serde_json::json!({
-                    "path": remote_path,
-                    "manifest": manifest,
-                    "parent_version_id": null,
-                }))
+                .json(&commit_payload)
                 .send()
                 .await?;
 
@@ -222,11 +275,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
 
-            let version: FileVersion = commit_res.json().await?;
-            println!("Uploaded successfully!");
-            println!("  Remote Path: {}", remote_path);
-            println!("  Version ID:  {}", version.version_id);
-            println!("  BLAKE3:      {}", manifest.checksums.blake3);
+            let commit_body: serde_json::Value = commit_res.json().await?;
+            println!(
+                "Successfully committed! Version ID: {}",
+                commit_body["version_id"].as_str().unwrap_or("unknown")
+            );
         }
 
         Commands::Download {
@@ -234,14 +287,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             local_path,
             version,
         } => {
+            println!("Downloading '{}'...", remote_path);
             let mut url = format!("{}/api/v1/files{}", base_url, normalize_path(&remote_path)?);
-            if let Some(vid) = version {
-                url.push_str(&format!("?version_id={vid}"));
+            if let Some(v) = version {
+                url.push_str(&format!("?version_id={}", v));
             }
 
-            println!("Downloading {} -> {}", url, local_path.display());
             let res = client.get(&url).headers(headers.clone()).send().await?;
-
             if !res.status().is_success() {
                 eprintln!("Download failed: {}", res.text().await?);
                 std::process::exit(1);
@@ -250,8 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let bytes = res.bytes().await?;
             let mut file = File::create(&local_path)?;
             file.write_all(&bytes)?;
-
-            println!("Downloaded {} bytes to {}", bytes.len(), local_path.display());
+            println!("Saved {} bytes to {}", bytes.len(), local_path.display());
         }
 
         Commands::Ls { prefix } => {
@@ -264,11 +315,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let files: Vec<(String, FileVersion)> = res.json().await?;
-            println!("{:<40} {:<10} {:<38}", "PATH", "SIZE", "VERSION ID");
-            println!("{:-<90}", "");
-            for (path, ver) in files {
-                let size = ver.manifest.as_ref().map_or(0, |m| m.size);
-                println!("{:<40} {:<10} {:<38}", path, size, ver.version_id);
+            println!("{:<50} {:<12} {:<38}", "PATH", "SIZE", "HEAD VERSION ID");
+            println!("{:-<102}", "");
+            for (p, v) in files {
+                let size = v.manifest.as_ref().map_or(0, |m| m.size);
+                println!("{:<50} {:<12} {:<38}", p, size, v.version_id);
             }
         }
 
@@ -277,8 +328,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             version,
         } => {
             let mut url = format!("{}/api/v1/files{}", base_url, normalize_path(&remote_path)?);
-            if let Some(vid) = version {
-                url.push_str(&format!("?version_id={vid}"));
+            if let Some(v) = version {
+                url.push_str(&format!("?version_id={}", v));
             }
 
             let res = client.delete(&url).headers(headers.clone()).send().await?;
@@ -287,15 +338,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
 
-            println!("Successfully deleted {}", remote_path);
+            println!("File '{}' successfully deleted.", remote_path);
         }
 
         Commands::Gc => {
+            println!("Triggering background GC and compaction...");
             let url = format!("{}/api/v1/gc", base_url);
             let res = client.post(&url).headers(headers.clone()).send().await?;
 
             if !res.status().is_success() {
-                eprintln!("GC failed: {}", res.text().await?);
+                eprintln!("GC trigger failed: {}", res.text().await?);
                 std::process::exit(1);
             }
 
@@ -349,6 +401,189 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let restored: FileVersion = res.json().await?;
             println!("Restored successfully! New HEAD version: {}", restored.version_id);
         }
+
+        Commands::User(user_cmd) => match user_cmd {
+            UserCommands::Create {
+                user_id,
+                password,
+                role,
+            } => {
+                let url = format!("{}/api/v1/users", base_url);
+                let res = client
+                    .post(&url)
+                    .headers(headers.clone())
+                    .json(&serde_json::json!({
+                        "user_id": user_id,
+                        "password": password,
+                        "role": role
+                    }))
+                    .send()
+                    .await?;
+
+                if !res.status().is_success() {
+                    eprintln!("Failed to create user: {}", res.text().await?);
+                    std::process::exit(1);
+                }
+
+                let body: serde_json::Value = res.json().await?;
+                println!("User created successfully:");
+                println!("  Username: {}", body["user_id"]);
+                println!("  Role:     {}", body["role"]);
+            }
+            UserCommands::Ls => {
+                let url = format!("{}/api/v1/users", base_url);
+                let res = client.get(&url).headers(headers.clone()).send().await?;
+
+                if !res.status().is_success() {
+                    eprintln!("Failed to list users: {}", res.text().await?);
+                    std::process::exit(1);
+                }
+
+                let users: serde_json::Value = res.json().await?;
+                println!("{:<24} {:<12} {:<24}", "USER ID", "ROLE", "CREATED AT (MS)");
+                println!("{:-<62}", "");
+                if let Some(arr) = users.as_array() {
+                    for u in arr {
+                        println!(
+                            "{:<24} {:<12} {:<24}",
+                            u["user_id"].as_str().unwrap_or(""),
+                            u["role"].as_str().unwrap_or(""),
+                            u["created_at_ms"].as_u64().unwrap_or(0)
+                        );
+                    }
+                }
+            }
+            UserCommands::Get { user_id } => {
+                let url = format!("{}/api/v1/users/{}", base_url, user_id);
+                let res = client.get(&url).headers(headers.clone()).send().await?;
+
+                if !res.status().is_success() {
+                    eprintln!("Failed to get user: {}", res.text().await?);
+                    std::process::exit(1);
+                }
+
+                let u: serde_json::Value = res.json().await?;
+                println!("User Details:");
+                println!("  User ID:    {}", u["user_id"].as_str().unwrap_or(""));
+                println!("  Role:       {}", u["role"].as_str().unwrap_or(""));
+                println!("  Created Ms: {}", u["created_at_ms"].as_u64().unwrap_or(0));
+            }
+            UserCommands::Passwd {
+                user_id,
+                new_password,
+            } => {
+                let url = format!("{}/api/v1/users/{}/password", base_url, user_id);
+                let res = client
+                    .put(&url)
+                    .headers(headers.clone())
+                    .json(&serde_json::json!({ "new_password": new_password }))
+                    .send()
+                    .await?;
+
+                if !res.status().is_success() {
+                    eprintln!("Failed to change password: {}", res.text().await?);
+                    std::process::exit(1);
+                }
+
+                println!("Password for user '{}' updated successfully.", user_id);
+            }
+            UserCommands::SetRole { user_id, role } => {
+                let url = format!("{}/api/v1/users/{}/role", base_url, user_id);
+                let res = client
+                    .put(&url)
+                    .headers(headers.clone())
+                    .json(&serde_json::json!({ "role": role }))
+                    .send()
+                    .await?;
+
+                if !res.status().is_success() {
+                    eprintln!("Failed to change role: {}", res.text().await?);
+                    std::process::exit(1);
+                }
+
+                println!("Role for user '{}' updated to '{}'.", user_id, role);
+            }
+            UserCommands::Delete { user_id } => {
+                let url = format!("{}/api/v1/users/{}", base_url, user_id);
+                let res = client.delete(&url).headers(headers.clone()).send().await?;
+
+                if !res.status().is_success() {
+                    eprintln!("Failed to delete user: {}", res.text().await?);
+                    std::process::exit(1);
+                }
+
+                println!("User '{}' and all associated tokens deleted.", user_id);
+            }
+        },
+
+        Commands::Token(token_cmd) => match token_cmd {
+            TokenCommands::Create { name, user_id } => {
+                let url = format!("{}/api/v1/tokens", base_url);
+                let mut payload = serde_json::json!({ "name": name });
+                if let Some(uid) = user_id {
+                    payload["user_id"] = serde_json::Value::String(uid);
+                }
+
+                let res = client
+                    .post(&url)
+                    .headers(headers.clone())
+                    .json(&payload)
+                    .send()
+                    .await?;
+
+                if !res.status().is_success() {
+                    eprintln!("Failed to create token: {}", res.text().await?);
+                    std::process::exit(1);
+                }
+
+                let body: serde_json::Value = res.json().await?;
+                println!("Token created successfully!");
+                println!("  Token ID:  {}", body["token_id"].as_str().unwrap_or(""));
+                println!("  User ID:   {}", body["user_id"].as_str().unwrap_or(""));
+                println!("  Name:      {}", body["name"].as_str().unwrap_or(""));
+                println!("  API Token: {}", body["token"].as_str().unwrap_or(""));
+                println!("\nKeep this token safe! It will not be shown again.");
+            }
+            TokenCommands::Ls { user_id } => {
+                let mut url = format!("{}/api/v1/tokens", base_url);
+                if let Some(uid) = user_id {
+                    url.push_str(&format!("?user_id={}", uid));
+                }
+
+                let res = client.get(&url).headers(headers.clone()).send().await?;
+
+                if !res.status().is_success() {
+                    eprintln!("Failed to list tokens: {}", res.text().await?);
+                    std::process::exit(1);
+                }
+
+                let tokens: serde_json::Value = res.json().await?;
+                println!("{:<38} {:<18} {:<24} {:<20}", "TOKEN ID", "USER ID", "NAME", "CREATED AT (MS)");
+                println!("{:-<102}", "");
+                if let Some(arr) = tokens.as_array() {
+                    for t in arr {
+                        println!(
+                            "{:<38} {:<18} {:<24} {:<20}",
+                            t["token_id"].as_str().unwrap_or(""),
+                            t["user_id"].as_str().unwrap_or(""),
+                            t["name"].as_str().unwrap_or(""),
+                            t["created_at_ms"].as_u64().unwrap_or(0)
+                        );
+                    }
+                }
+            }
+            TokenCommands::Revoke { token_id } => {
+                let url = format!("{}/api/v1/tokens/{}", base_url, token_id);
+                let res = client.delete(&url).headers(headers.clone()).send().await?;
+
+                if !res.status().is_success() {
+                    eprintln!("Failed to revoke token: {}", res.text().await?);
+                    std::process::exit(1);
+                }
+
+                println!("Token '{}' revoked successfully.", token_id);
+            }
+        },
     }
 
     Ok(())

@@ -19,16 +19,16 @@ impl UruS3Adapter {
         Self { storage, users }
     }
 
-    fn resolve_user<T>(&self, req: &s3s::S3Request<T>) -> String {
+    fn resolve_user<T>(&self, req: &s3s::S3Request<T>) -> S3Result<String> {
         if let Some(cred) = &req.credentials {
             if let Some(user) = self.users.get_user(&cred.access_key) {
-                return user.user_id;
+                return Ok(user.user_id);
             }
             if let Some(user) = self.users.authenticate_api_key(&cred.access_key) {
-                return user.user_id;
+                return Ok(user.user_id);
             }
         }
-        "default_user".to_string()
+        Err(s3_error!(AccessDenied, "Access denied: valid API token or username credentials required"))
     }
 
     fn object_path(bucket: &str, key: &str) -> String {
@@ -65,7 +65,7 @@ impl S3 for UruS3Adapter {
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
         metrics::counter!("uru_cas_http_requests_total", "protocol" => "s3", "method" => "PUT", "status" => "200").increment(1);
-        let user_id = self.resolve_user(&req);
+        let user_id = self.resolve_user(&req)?;
         let input = req.input;
         let vpath = Self::object_path(&input.bucket, &input.key);
 
@@ -117,7 +117,7 @@ impl S3 for UruS3Adapter {
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         metrics::counter!("uru_cas_http_requests_total", "protocol" => "s3", "method" => "GET", "status" => "200").increment(1);
-        let user_id = self.resolve_user(&req);
+        let user_id = self.resolve_user(&req)?;
         let input = req.input;
         let vpath = Self::object_path(&input.bucket, &input.key);
 
@@ -177,7 +177,7 @@ impl S3 for UruS3Adapter {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
-        let user_id = self.resolve_user(&req);
+        let user_id = self.resolve_user(&req)?;
         let input = req.input;
         let vpath = Self::object_path(&input.bucket, &input.key);
 
@@ -210,7 +210,7 @@ impl S3 for UruS3Adapter {
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let user_id = self.resolve_user(&req);
+        let user_id = self.resolve_user(&req)?;
         let input = req.input;
         let vpath = Self::object_path(&input.bucket, &input.key);
 
@@ -235,7 +235,7 @@ impl S3 for UruS3Adapter {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
-        let user_id = self.resolve_user(&req);
+        let user_id = self.resolve_user(&req)?;
         let input = req.input;
         let prefix = format!("/{}", input.bucket.trim_matches('/'));
 
@@ -269,7 +269,7 @@ impl S3 for UruS3Adapter {
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
-        let user_id = self.resolve_user(&req);
+        let user_id = self.resolve_user(&req)?;
         let input = req.input;
         let prefix = format!("/{}", input.bucket.trim_matches('/'));
 

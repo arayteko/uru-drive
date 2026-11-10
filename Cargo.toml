@@ -71,6 +71,9 @@ opentelemetry-otlp = { version = "0.33.1", features = ["metrics", "http-proto", 
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+# Database
+rocksdb = "0.25.0"
+
 # Auth & Security
 argon2 = "0.6.0"
 subtle = "2.6.1"
