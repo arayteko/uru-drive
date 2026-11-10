@@ -71,6 +71,10 @@ opentelemetry-otlp = { version = "0.33.1", features = ["metrics", "http-proto", 
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+# TUI
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+
 # Database
 rocksdb = "0.25.0"
 

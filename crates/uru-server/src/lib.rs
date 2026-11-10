@@ -4,6 +4,7 @@ pub mod dav_adapter;
 pub mod metrics_service;
 pub mod s3_adapter;
 pub mod state;
+pub mod tui;
 pub mod user_api;
 
 use axum::{

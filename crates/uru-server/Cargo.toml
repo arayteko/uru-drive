@@ -46,6 +46,8 @@ opentelemetry-otlp = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
 thiserror = "2.0.21"
 
 [dev-dependencies]
